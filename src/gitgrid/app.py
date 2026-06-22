@@ -22,7 +22,7 @@ IGNORE_DIRS = {
 class MultiRepoGitApp(App):
     """一个管理当前目录及所有子目录下 Git 仓库的 TUI 工具"""
 
-    TITLE = "Multi-Repo Git Status (递归版)"
+    TITLE = "Multi-Repo Git Status"
     CSS = """
     DataTable {
         height: 100%;
@@ -31,9 +31,9 @@ class MultiRepoGitApp(App):
     """
 
     BINDINGS = [
-        Binding("q", "quit", "退出"),
-        Binding("r", "refresh", "刷新状态"),
-        Binding("f", "toggle_fetch", "开关 Fetch"),
+        Binding("q", "quit", "Quit"),
+        Binding("r", "refresh", "Refresh"),
+        Binding("f", "toggle_fetch", "Toggle Fetch"),
     ]
 
     # 是否在刷新时先执行 git fetch 更新远程跟踪分支
@@ -51,13 +51,13 @@ class MultiRepoGitApp(App):
         table.zebra_stripes = True
 
         table.add_columns(
-            "仓库路径 (Path)",
-            "分支 (Branch)",
-            "远端 (Remote)",
-            "暂存 (Staged)",
-            "修改 (Modified)",
-            "未追踪 (Untracked)",
-            "储藏 (Stash)"
+            "Path",
+            "Branch",
+            "Remote",
+            "Staged",
+            "Modified",
+            "Untracked",
+            "Stash"
         )
         self.action_refresh()
 
@@ -89,7 +89,7 @@ class MultiRepoGitApp(App):
 
         if self.auto_fetch and total:
             self.call_from_thread(
-                setattr, self, "sub_title", f"正在 fetch {total} 个仓库…"
+                setattr, self, "sub_title", f"Fetching {total} repos…"
             )
             # 并行 fetch，避免逐个网络往返把整体拖慢
             with ThreadPoolExecutor(max_workers=8) as pool:
@@ -97,7 +97,7 @@ class MultiRepoGitApp(App):
 
         self.call_from_thread(
             setattr, self, "sub_title",
-            f"{total} 个仓库 | Fetch: {'开' if self.auto_fetch else '关'}"
+            f"{total} repos | Fetch: {'on' if self.auto_fetch else 'off'}"
         )
 
         # 并行收集各仓库状态
@@ -157,7 +157,7 @@ class MultiRepoGitApp(App):
             branch = f"({branch})"
 
         # 2. 远端状态 (Ahead/Behind)
-        remote_status = "✔️ 同步"
+        remote_status = "✔️ synced"
         behind_count = 0
         upstream = self.run_cmd(["git", "rev-parse", "--abbrev-ref", "@{u}"], cwd=path)
         if upstream and upstream != "@{u}":
