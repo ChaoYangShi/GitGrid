@@ -509,35 +509,57 @@ class MultiRepoGitApp(App):
             return ""
 
     def get_git_status(self, path: str, name: str) -> dict:
-        # 1. 分支名
-        branch = self.run_cmd(["git", "branch", "--show-current"], cwd=path)
+        # 用一条 git status --branch --porcelain=v2 同时拿到分支、上游、
+        # ahead/behind 计数和所有文件状态，替代原先 6 条独立命令；
+        # stash 无法由该命令提供，单独再取一条。
+        raw = self.run_cmd(
+            ["git", "status", "--branch", "--porcelain=v2"], cwd=path
+        )
+
+        branch = ""
+        has_upstream = False
+        ahead = behind = 0
+        staged_count = modified_count = untracked_count = 0
+
+        for line in raw.splitlines():
+            if line.startswith("# branch.head "):
+                branch = line[len("# branch.head "):]
+                if branch == "(detached)":
+                    branch = ""
+            elif line.startswith("# branch.upstream "):
+                has_upstream = True
+            elif line.startswith("# branch.ab "):
+                # 格式: "# branch.ab +A -B"
+                parts = line.split()
+                try:
+                    ahead = int(parts[2])      # +A
+                    behind = -int(parts[3])    # -B（带负号）
+                except (IndexError, ValueError):
+                    pass
+            elif line.startswith("1 ") or line.startswith("2 "):
+                # 已跟踪变更：第二字段是 XY，X=暂存区状态，Y=工作区状态
+                xy = line.split(" ", 2)[1]
+                if len(xy) == 2:
+                    if xy[0] != ".":
+                        staged_count += 1
+                    if xy[1] != ".":
+                        modified_count += 1
+            elif line.startswith("? "):
+                untracked_count += 1
+
+        # 分支名兜底（无任何提交等极端情况）
         if not branch:
-            branch = self.run_cmd(["git", "rev-parse", "--short", "HEAD"], cwd=path)
-            branch = f"({branch})"
+            short = self.run_cmd(["git", "rev-parse", "--short", "HEAD"], cwd=path)
+            branch = f"({short})" if short else "(unknown)"
 
-        # 2. 远端状态 (Ahead/Behind)
-        remote_status = "✔️ synced"
-        behind_count = 0
-        upstream = self.run_cmd(["git", "rev-parse", "--abbrev-ref", "@{u}"], cwd=path)
-        if upstream and upstream != "@{u}":
-            counts = self.run_cmd(["git", "rev-list", "--left-right", "--count", f"HEAD...{upstream}"], cwd=path)
-            if counts:
-                ahead, behind = counts.split()
-                behind_count = int(behind)
-                if ahead != "0" or behind != "0":
-                    remote_status = f"⬆️ {ahead} ⬇️ {behind}"
+        # 远端状态
+        if has_upstream and (ahead or behind):
+            remote_status = f"⬆️ {ahead} ⬇️ {behind}"
+        else:
+            remote_status = "✔️ synced"
+        behind_count = behind
 
-        # 3. 本地变动统计
-        staged = self.run_cmd(["git", "diff", "--name-only", "--cached"], cwd=path)
-        staged_count = len(staged.splitlines()) if staged else 0
-
-        modified = self.run_cmd(["git", "diff", "--name-only"], cwd=path)
-        modified_count = len(modified.splitlines()) if modified else 0
-
-        untracked = self.run_cmd(["git", "ls-files", "--others", "--exclude-standard"], cwd=path)
-        untracked_count = len(untracked.splitlines()) if untracked else 0
-
-        # 4. Stash 统计
+        # Stash 统计（单独一条，porcelain 无法提供）
         stash = self.run_cmd(["git", "stash", "list"], cwd=path)
         stash_count = len(stash.splitlines()) if stash else 0
 
