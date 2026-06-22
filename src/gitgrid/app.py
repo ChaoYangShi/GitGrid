@@ -292,11 +292,16 @@ class MultiRepoGitApp(App):
         Binding("q", "quit", "Quit"),
         Binding("r", "refresh", "Refresh"),
         Binding("f", "toggle_fetch", "Toggle Fetch"),
+        Binding("p", "toggle_pull", "Toggle Pull"),
     ]
 
     # 是否在刷新时先执行 git fetch 更新远程跟踪分支
     # 关闭后只看本地缓存的远端状态（速度快，但可能过期）
     auto_fetch = True
+
+    # 是否在 fetch 后对有上游的仓库执行一键拉取（git pull --ff-only）
+    # 默认关闭，按 p 打开；--ff-only 保证只在可快进时拉取，遇分叉会安全拒绝
+    auto_pull = False
 
     def __init__(self) -> None:
         super().__init__()
@@ -329,6 +334,14 @@ class MultiRepoGitApp(App):
         self.auto_fetch = not self.auto_fetch
         self.action_refresh()
 
+    def action_toggle_pull(self) -> None:
+        """切换是否一键拉取（git pull --ff-only）。开启时会顺带打开 fetch"""
+        self.auto_pull = not self.auto_pull
+        if self.auto_pull:
+            # 拉取依赖最新的远程引用，开启拉取时强制保证 fetch 也开着
+            self.auto_fetch = True
+        self.action_refresh()
+
     def action_refresh(self) -> None:
         # 把耗时的扫描 + fetch 放到后台 worker，避免阻塞 UI
         self.refresh_worker()
@@ -356,11 +369,29 @@ class MultiRepoGitApp(App):
             )
             # 并行 fetch，避免逐个网络往返把整体拖慢
             with ThreadPoolExecutor(max_workers=8) as pool:
-                pool.map(self.git_fetch, repo_paths)
+                fetch_results = list(pool.map(self.git_fetch, repo_paths))
+            failed = fetch_results.count("error")
+            if failed:
+                self.call_from_thread(
+                    self.notify,
+                    f"Fetch: {failed}/{total} failed",
+                    title="Fetch",
+                    severity="warning",
+                )
+
+        if self.auto_pull and total:
+            self.call_from_thread(
+                setattr, self, "sub_title", f"Pulling {total} repos…"
+            )
+            # 并行一键拉取（--ff-only），同样限制并发避免拖慢
+            with ThreadPoolExecutor(max_workers=8) as pool:
+                pull_results = list(pool.map(self.git_pull, repo_paths))
+            self.call_from_thread(self.report_pull, pull_results)
 
         self.call_from_thread(
             setattr, self, "sub_title",
             f"{total} repos | Fetch: {'on' if self.auto_fetch else 'off'}"
+            f" | Pull: {'on' if self.auto_pull else 'off'}"
         )
 
         # 并行收集各仓库状态
@@ -401,18 +432,74 @@ class MultiRepoGitApp(App):
         if path:
             self.push_screen(RepoDetailScreen(path))
 
-    def git_fetch(self, path: str) -> None:
-        """更新远程跟踪分支，加超时防止远端无响应时挂死整个刷新"""
+    def report_pull(self, results: list) -> None:
+        """汇总一键拉取结果并以 toast 通知，让被拒/失败的仓库可见"""
+        updated = results.count("updated")
+        rejected = results.count("rejected")
+        errors = results.count("error")
+        # 已最新 / 无上游 视为无需关注，不计入提示
+        parts = []
+        if updated:
+            parts.append(f"{updated} updated")
+        if rejected:
+            parts.append(f"{rejected} rejected (not fast-forward)")
+        if errors:
+            parts.append(f"{errors} error")
+        if not parts:
+            self.notify("Pull: nothing to update", title="Pull")
+            return
+        severity = "warning" if (rejected or errors) else "information"
+        self.notify(" · ".join(parts), title="Pull", severity=severity)
+
+    def git_fetch(self, path: str) -> str:
+        """更新远程跟踪分支，加超时防止远端无响应时挂死整个刷新。
+
+        返回: "ok" 成功 / "error" 失败或超时
+        """
         try:
-            subprocess.run(
+            result = subprocess.run(
                 ["git", "fetch", "--quiet"],
                 cwd=path,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
                 timeout=20,
             )
+            return "ok" if result.returncode == 0 else "error"
         except Exception:
-            pass
+            return "error"
+
+    def git_pull(self, path: str) -> str:
+        """一键拉取：git pull --ff-only。
+
+        --ff-only 只在能快进时更新，遇到本地分叉/冲突会安全失败而非
+        制造 merge commit。有本地改动时 git 也会拒绝覆盖，因此不会
+        破坏工作区。加超时防止远端无响应挂死。
+
+        返回: "updated" 成功快进 / "uptodate" 已是最新 /
+              "noupstream" 无上游跳过 / "rejected" 无法快进被拒 /
+              "error" 其他失败或超时
+        """
+        # 无上游的仓库直接跳过，不计入失败
+        upstream = self.run_cmd(["git", "rev-parse", "--abbrev-ref", "@{u}"], cwd=path)
+        if not upstream or upstream == "@{u}":
+            return "noupstream"
+        try:
+            result = subprocess.run(
+                ["git", "pull", "--ff-only"],
+                cwd=path,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=60,
+            )
+            if result.returncode == 0:
+                # 输出含 "Already up to date" 表示无更新
+                if "up to date" in (result.stdout + result.stderr).lower():
+                    return "uptodate"
+                return "updated"
+            return "rejected"
+        except Exception:
+            return "error"
 
     def run_cmd(self, cmd: list, cwd: str) -> str:
         try:
